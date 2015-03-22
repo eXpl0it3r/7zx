@@ -19,7 +19,7 @@ extern "C" {
 /// \return SZ_OK if successful
 ///
 ////////////////////////////////////////////////////////////
-extern SRes SzxExtract(char* filename, Bool fullPaths = 1);
+extern SRes SzxExtract(const char* filename, Bool fullPaths = 1);
 
 ////////////////////////////////////////////////////////////
 /// \brief List the content of an 7z archive
@@ -31,7 +31,7 @@ extern SRes SzxExtract(char* filename, Bool fullPaths = 1);
 /// \return SZ_OK if successful
 ///
 ////////////////////////////////////////////////////////////
-extern SRes SzxList(char* filename, char* list, size_t* size);
+extern SRes SzxList(const char* filename, char* list, size_t* size);
 
 ////////////////////////////////////////////////////////////
 /// \brief Test the integrity of an 7z archive
@@ -41,7 +41,7 @@ extern SRes SzxList(char* filename, char* list, size_t* size);
 /// \return SZ_OK if successful
 ///
 ////////////////////////////////////////////////////////////
-extern SRes SzxTest(char* filename);
+extern SRes SzxTest(const char* filename);
 
 #ifdef __cplusplus
 }

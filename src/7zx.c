@@ -284,7 +284,7 @@ static void GetAttribString(UInt32, Bool, char *s)
 
 // #define NUM_PARENTS_MAX 128
 
-SRes SzxExtract(char* filename, Bool fullPaths)
+SRes SzxExtract(const char* filename, Bool fullPaths)
 {
   CFileInStream archiveStream;
   CLookToRead lookStream;
@@ -434,7 +434,7 @@ SRes SzxExtract(char* filename, Bool fullPaths)
   return res;
 }
 
-SRes SzxList(char* filename, char* list, size_t* size)
+SRes SzxList(const char* filename, char* list, size_t* size)
 {
   CFileInStream archiveStream;
   CLookToRead lookStream;
@@ -587,7 +587,7 @@ SRes SzxList(char* filename, char* list, size_t* size)
   return res;
 }
 
-SRes SzxTest(char* filename)
+SRes SzxTest(const char* filename)
 {
   CFileInStream archiveStream;
   CLookToRead lookStream;
