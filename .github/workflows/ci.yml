@@ -23,6 +23,9 @@ jobs:
       matrix:
         platform:
         - { name: Windows VS2026, os: windows-2025 }
+        - { name: Linux GCC,      os: ubuntu-26.04 }
+        - { name: Linux Clang,    os: ubuntu-26.04, flags: -DCMAKE_C_COMPILER=clang }
+        - { name: macOS Xcode,    os: macos-26 }
 
     steps:
     - name: Checkout Code
@@ -31,7 +34,9 @@ jobs:
         persist-credentials: false
 
     - name: Configure CMake
-      run: cmake -S "$GITHUB_WORKSPACE" -B "$GITHUB_WORKSPACE/build" -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" -DCMAKE_VERBOSE_MAKEFILE=ON
+      env:
+        CMAKE_FLAGS: ${{ matrix.platform.flags }}
+      run: cmake -S "$GITHUB_WORKSPACE" -B "$GITHUB_WORKSPACE/build" -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" -DCMAKE_VERBOSE_MAKEFILE=ON $CMAKE_FLAGS
 
     - name: Build
       run: cmake --build "$GITHUB_WORKSPACE/build" --config Release --target install
