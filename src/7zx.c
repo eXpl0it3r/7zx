@@ -1,29 +1,48 @@
 /* 7zx.c - Library source file for 7zx
-2015-03-22 : Lukas Duerrenberger : Public domain */
+Based on Util/7z/7zMain.c of the LZMA SDK 26.03 : Igor Pavlov : Public domain
+2026-10-01 : Lukas Duerrenberger : Public domain */
 
 #include "Precomp.h"
 
 #include <stdio.h>
 #include <string.h>
 
-#include "7z.h"
-#include "7zAlloc.h"
-#include "7zBuf.h"
-#include "7zCrc.h"
 #include "7zFile.h"
-#include "7zVersion.h"
 
 #ifndef USE_WINDOWS_FILE
-/* for mkdir */
 #ifdef _WIN32
-#include <direct.h>
+#include <direct.h> // for _mkdir()
 #else
+#include <stdlib.h>
+#include <time.h>
+#ifdef __GNUC__
+#include <sys/time.h>
+#endif
+#include <fcntl.h>
+// #include <utime.h>
 #include <sys/stat.h>
 #include <errno.h>
 #endif
 #endif
 
-static ISzAlloc g_Alloc = { SzAlloc, SzFree };
+#ifdef _WIN32
+#include "7zWindows.h"
+#endif
+
+#include "7z.h"
+#include "7zAlloc.h"
+#include "7zBuf.h"
+#include "7zCrc.h"
+
+#include "CpuArch.h"
+
+#include <7zx/7zx.h>
+
+#define kInputBufSize ((size_t)1 << 18)
+
+static const ISzAlloc g_Alloc = { SzAlloc, SzFree };
+// static const ISzAlloc g_Alloc_temp = { SzAllocTemp, SzFreeTemp };
+
 
 static int Buf_EnsureSize(CBuf *dest, size_t size)
 {
@@ -34,95 +53,137 @@ static int Buf_EnsureSize(CBuf *dest, size_t size)
 }
 
 #ifndef _WIN32
+#define MY_USE_UTF8
+#endif
 
-static Byte kUtf8Limits[5] = { 0xC0, 0xE0, 0xF0, 0xF8, 0xFC };
+/* #define MY_USE_UTF8 */
 
-static Bool Utf16_To_Utf8(Byte *dest, size_t *destLen, const UInt16 *src, size_t srcLen)
+#ifdef MY_USE_UTF8
+
+#define MY_UTF8_START(n) (0x100 - (1 << (7 - (n))))
+
+#define MY_UTF8_RANGE(n) (((UInt32)1) << ((n) * 5 + 6))
+
+#define MY_UTF8_HEAD(n, val) ((Byte)(MY_UTF8_START(n) + (val >> (6 * (n)))))
+#define MY_UTF8_CHAR(n, val) ((Byte)(0x80 + (((val) >> (6 * (n))) & 0x3F)))
+
+static size_t Utf16_To_Utf8_Calc(const UInt16 *src, const UInt16 *srcLim)
 {
-  size_t destPos = 0, srcPos = 0;
+  size_t size = 0;
   for (;;)
   {
-    unsigned numAdds;
-    UInt32 value;
-    if (srcPos == srcLen)
+    UInt32 val;
+    if (src == srcLim)
+      return size;
+    
+    size++;
+    val = *src++;
+   
+    if (val < 0x80)
+      continue;
+
+    if (val < MY_UTF8_RANGE(1))
     {
-      *destLen = destPos;
-      return True;
-    }
-    value = src[srcPos++];
-    if (value < 0x80)
-    {
-      if (dest)
-        dest[destPos] = (char)value;
-      destPos++;
+      size++;
       continue;
     }
-    if (value >= 0xD800 && value < 0xE000)
+
+    if (val >= 0xD800 && val < 0xDC00 && src != srcLim)
     {
-      UInt32 c2;
-      if (value >= 0xDC00 || srcPos == srcLen)
-        break;
-      c2 = src[srcPos++];
-      if (c2 < 0xDC00 || c2 >= 0xE000)
-        break;
-      value = (((value - 0xD800) << 10) | (c2 - 0xDC00)) + 0x10000;
+      const UInt32 c2 = *src;
+      if (c2 >= 0xDC00 && c2 < 0xE000)
+      {
+        src++;
+        size += 3;
+        continue;
+      }
     }
-    for (numAdds = 1; numAdds < 5; numAdds++)
-      if (value < (((UInt32)1) << (numAdds * 5 + 6)))
-        break;
-    if (dest)
-      dest[destPos] = (char)(kUtf8Limits[numAdds - 1] + (value >> (6 * numAdds)));
-    destPos++;
-    do
-    {
-      numAdds--;
-      if (dest)
-        dest[destPos] = (char)(0x80 + ((value >> (6 * numAdds)) & 0x3F));
-      destPos++;
-    }
-    while (numAdds != 0);
+
+    size += 2;
   }
-  *destLen = destPos;
-  return False;
+}
+
+static Byte *Utf16_To_Utf8(Byte *dest, const UInt16 *src, const UInt16 *srcLim)
+{
+  for (;;)
+  {
+    UInt32 val;
+    if (src == srcLim)
+      return dest;
+    
+    val = *src++;
+    
+    if (val < 0x80)
+    {
+      *dest++ = (Byte)val;
+      continue;
+    }
+
+    if (val < MY_UTF8_RANGE(1))
+    {
+      dest[0] = MY_UTF8_HEAD(1, val);
+      dest[1] = MY_UTF8_CHAR(0, val);
+      dest += 2;
+      continue;
+    }
+
+    if (val >= 0xD800 && val < 0xDC00 && src != srcLim)
+    {
+      const UInt32 c2 = *src;
+      if (c2 >= 0xDC00 && c2 < 0xE000)
+      {
+        src++;
+        val = (((val - 0xD800) << 10) | (c2 - 0xDC00)) + 0x10000;
+        dest[0] = MY_UTF8_HEAD(3, val);
+        dest[1] = MY_UTF8_CHAR(2, val);
+        dest[2] = MY_UTF8_CHAR(1, val);
+        dest[3] = MY_UTF8_CHAR(0, val);
+        dest += 4;
+        continue;
+      }
+    }
+    
+    dest[0] = MY_UTF8_HEAD(2, val);
+    dest[1] = MY_UTF8_CHAR(1, val);
+    dest[2] = MY_UTF8_CHAR(0, val);
+    dest += 3;
+  }
 }
 
 static SRes Utf16_To_Utf8Buf(CBuf *dest, const UInt16 *src, size_t srcLen)
 {
-  size_t destLen = 0;
-  Bool res;
-  Utf16_To_Utf8(NULL, &destLen, src, srcLen);
+  size_t destLen = Utf16_To_Utf8_Calc(src, src + srcLen);
   destLen += 1;
   if (!Buf_EnsureSize(dest, destLen))
     return SZ_ERROR_MEM;
-  res = Utf16_To_Utf8(dest->data, &destLen, src, srcLen);
-  dest->data[destLen] = 0;
-  return res ? SZ_OK : SZ_ERROR_FAIL;
+  *Utf16_To_Utf8(dest->data, src, src + srcLen) = 0;
+  return SZ_OK;
 }
 
 #endif
 
 static SRes Utf16_To_Char(CBuf *buf, const UInt16 *s
-    #ifdef _WIN32
+    #ifndef MY_USE_UTF8
     , UINT codePage
     #endif
     )
 {
-  unsigned len = 0;
-  for (len = 0; s[len] != 0; len++);
+  size_t len = 0;
+  for (len = 0; s[len] != 0; len++) {}
 
-  #ifdef _WIN32
+  #ifndef MY_USE_UTF8
   {
-    unsigned size = len * 3 + 100;
+    const size_t size = len * 3 + 100;
     if (!Buf_EnsureSize(buf, size))
       return SZ_ERROR_MEM;
     {
       buf->data[0] = 0;
       if (len != 0)
       {
-        char defaultChar = '_';
+        const char defaultChar = '_';
         BOOL defUsed;
-        unsigned numChars = 0;
-        numChars = WideCharToMultiByte(codePage, 0, s, len, (char *)buf->data, size, &defaultChar, &defUsed);
+        const unsigned numChars = (unsigned)WideCharToMultiByte(
+            codePage, 0, (LPCWSTR)s, (int)len, (char *)buf->data, (int)size, &defaultChar, &defUsed);
         if (numChars == 0 || numChars >= size)
           return SZ_ERROR_FAIL;
         buf->data[numChars] = 0;
@@ -135,27 +196,259 @@ static SRes Utf16_To_Char(CBuf *buf, const UInt16 *s
   #endif
 }
 
+
+#ifdef _WIN32
+
+static Z7_FORCE_INLINE unsigned MyCharLower_Ascii(unsigned c)
+{
+  if (c >= 'A' && c <= 'Z')
+    return (unsigned)(c + 0x20);
+  return c;
+}
+
+static Z7_FORCE_INLINE
+BoolInt IsString1PrefixedByString2_NoCase_Ascii(const UInt16 *s1, const char *s2)
+{
+  for (;;)
+  {
+    wchar_t c1;
+    const char c2 = *s2++; if (c2 == 0) return True;
+    c1 = *s1++;
+    if (c1 != (unsigned char)c2 && MyCharLower_Ascii(c1) != MyCharLower_Ascii((unsigned char)c2))
+      return False;
+  }
+}
+
+
+static const unsigned g_ReservedWithNum_Index = 4;
+static const char * const g_ReservedNames[] =
+{
+  "CON", "PRN", "AUX", "NUL",
+  "COM", "LPT"
+};
+
+static Z7_FORCE_INLINE
+BoolInt IsReservedFsName(const UInt16 *name, size_t sLen)
+{
+  unsigned i;
+  for (i = 0; i < Z7_ARRAY_SIZE(g_ReservedNames); i++)
+  {
+    const char *reservedName = g_ReservedNames[i];
+    size_t len = strlen(reservedName);
+    if (sLen < len)
+      continue;
+    if (!IsString1PrefixedByString2_NoCase_Ascii(name, reservedName))
+      continue;
+    if (i >= g_ReservedWithNum_Index)
+    {
+      if ((unsigned)((unsigned)name[len] - (unsigned)'0') > 9)
+        continue;
+      len++;
+    }
+    for (;;)
+    {
+      unsigned c;
+      if (len >= sLen)
+        return True;
+      c = name[len++];
+      if (c == 0 || c == '.')
+        return True;
+      if (c != ' ')
+        break;
+    }
+  }
+  return False;
+}
+
+
+static Z7_FORCE_INLINE
+void Correct_FileName_for_FS(UInt16 *s, size_t size)
+{
+  while (size)
+  {
+    const unsigned c = s[--size];
+    if (c != '.' && c != ' ')
+      break;
+    s[size] = '_';
+  }
+}
+
+#endif // _WIN32
+
+
+// in: (s) uses WCHAR_PATH_SEPARATOR path separators
+static Z7_FORCE_INLINE
+void NormalizesPathParts_and_Dots(UInt16 *dest, const UInt16 *s, BoolInt isDir)
+{
+  UInt16 * const destStart = dest;
+  size_t len;
+
+  // remove absolute path prefixes
+  for (; *s == WCHAR_PATH_SEPARATOR; s++)
+  {}
+
+  len = 0;
+  for (;;)
+  {
+    const unsigned c = s[len];
+    if (c != 0 && c != WCHAR_PATH_SEPARATOR)
+    {
+      len++;
+      continue;
+    }
+    {
+      if (len == 0
+          || (len == 1 && s[len - 1] == '.')
+          || (len == 2 && s[len - 1] == '.' && s[len - 2] == '.'))
+      {
+        if (c == 0)
+        {
+          if (!isDir)
+          {
+            *dest++ = '_';
+            // if (len == 2) *dest++ = '_'; // for ".." -> "__"
+          }
+          break;
+        }
+      }
+      else
+      {
+#ifdef _WIN32
+        if (IsReservedFsName(s, len))
+          *dest++ = '_';
+#endif
+        memcpy(dest, s, sizeof(s[0]) * len);
+#ifdef _WIN32
+        Correct_FileName_for_FS(dest, len);
+#endif
+        dest += len;
+        if (c == 0)
+          break;
+        *dest++ = WCHAR_PATH_SEPARATOR;
+      }
+      s += len + 1;
+      len = 0;
+    }
+  }
+
+  if (dest != destStart && dest[-1] == WCHAR_PATH_SEPARATOR)
+  {
+    if (isDir)
+      dest--;
+    else
+      *dest++ = '_';
+  }
+ 
+  if (dest == destStart)
+    *dest++ = '_';
+  *dest = 0;
+}
+
+
+#if WCHAR_PATH_SEPARATOR != L'/'
+
+#ifdef _WIN32
+// WSL scheme
+#define WCHAR_IN_FILE_NAME_BACKSLASH_REPLACEMENT  ((unsigned)((unsigned)(0xF000) + (unsigned)'\\'))
+#else
+#define WCHAR_IN_FILE_NAME_BACKSLASH_REPLACEMENT  '_'
+#endif
+
+static Z7_FORCE_INLINE
+void Normalize_Path_from_7z_to_FS(UInt16 *s)
+{
+  // Normalize_Path_from_7z_to_FS(s);
+  for (;; s++)
+  {
+    unsigned c = *s;
+    if (c == 0)
+      break;
+    if (c == '/') // separator inside 7z archive
+      c = WCHAR_PATH_SEPARATOR;
+    else if (c == WCHAR_PATH_SEPARATOR)
+      c = WCHAR_IN_FILE_NAME_BACKSLASH_REPLACEMENT;
+#ifdef _WIN32
+    else if (c < 0x20 || c == ':' || c == '*' || c == '?' || c == '<' || c == '>' || c == '|' || c == '"')
+      c = '_';
+    else
+      continue;
+    *s = (UInt16)c;
+#endif
+  }
+}
+#endif
+
+
+// this function changes both strings: (dest) and (s),
+// but length of (s) string will not changed.
+// dest[] must provide additional space: size(dest) >= len(len) * 2 + 2
+// in:  (s) uses slash path separators (/)
+// out: (s) : temporary string
+// out: (dest) uses WCHAR_PATH_SEPARATOR path separator
+static Z7_FORCE_INLINE
+void NormalizePath_for_FS(UInt16 *dest, UInt16 *s, BoolInt isDir)
+{
+#if WCHAR_PATH_SEPARATOR != L'/'
+  Normalize_Path_from_7z_to_FS(s);
+#endif
+  NormalizesPathParts_and_Dots(dest, s , isDir);
+}
+
+
+
 #ifdef _WIN32
   #ifndef USE_WINDOWS_FILE
     static UINT g_FileCodePage = CP_ACP;
+    #define MY_FILE_CODE_PAGE_PARAM ,g_FileCodePage
   #endif
-  #define MY_FILE_CODE_PAGE_PARAM ,g_FileCodePage
 #else
   #define MY_FILE_CODE_PAGE_PARAM
+#endif
+
+#ifdef USE_WINDOWS_FILE
+
+static WRes My_DeleteFileAlways(const UInt16 *path)
+{
+  const DWORD attrib = GetFileAttributesW(path);
+  if (// attrib != INVALID_FILE_ATTRIBUTES &&
+      (attrib & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+      (attrib & FILE_ATTRIBUTE_READONLY))
+  {
+    if (!SetFileAttributesW(path,attrib & ~(DWORD)FILE_ATTRIBUTE_READONLY))
+      return GetLastError();
+  }
+  if (DeleteFileW(path))
+    return 0;
+  return GetLastError();
+}
+
+#else
+
+static WRes My_DeleteFileAlways(const UInt16 *path)
+{
+  CBuf buf;
+  WRes res;
+  Buf_Init(&buf);
+  RINOK_WRes(Utf16_To_Char(&buf, path MY_FILE_CODE_PAGE_PARAM))
+  res = remove((const char *)buf.data) == 0 ? 0 : errno;
+  Buf_Free(&buf, &g_Alloc);
+  return res;
+}
+
 #endif
 
 static WRes MyCreateDir(const UInt16 *name)
 {
   #ifdef USE_WINDOWS_FILE
-
-  return CreateDirectoryW(name, NULL) ? 0 : GetLastError();
-
+  
+  return CreateDirectoryW((LPCWSTR)name, NULL) ? 0 : GetLastError();
+  
   #else
 
   CBuf buf;
   WRes res;
   Buf_Init(&buf);
-  RINOK(Utf16_To_Char(&buf, name MY_FILE_CODE_PAGE_PARAM));
+  RINOK_WRes(Utf16_To_Char(&buf, name MY_FILE_CODE_PAGE_PARAM))
 
   res =
   #ifdef _WIN32
@@ -166,26 +459,56 @@ static WRes MyCreateDir(const UInt16 *name)
   == 0 ? 0 : errno;
   Buf_Free(&buf, &g_Alloc);
   return res;
-
+  
   #endif
 }
 
 static WRes OutFile_OpenUtf16(CSzFile *p, const UInt16 *name)
 {
   #ifdef USE_WINDOWS_FILE
-  return OutFile_OpenW(p, name);
+  return OutFile_OpenW(p, (LPCWSTR)name);
   #else
   CBuf buf;
   WRes res;
   Buf_Init(&buf);
-  RINOK(Utf16_To_Char(&buf, name MY_FILE_CODE_PAGE_PARAM));
+  RINOK(Utf16_To_Char(&buf, name MY_FILE_CODE_PAGE_PARAM))
   res = OutFile_Open(p, (const char *)buf.data);
   Buf_Free(&buf, &g_Alloc);
   return res;
   #endif
 }
 
-static void UInt64ToStr(UInt64 value, char *s)
+
+// (size(dest) >= len(src) + 3), if (isDir == True)
+// s[] uses slash path separator (/)
+// control characters are replaced, as tabs and line feeds separate the list entries
+static SRes GetListPath(CBuf *buf, const UInt16 *s, UInt16 *dest, BoolInt isDir)
+{
+  size_t i;
+  for (i = 0;; i++)
+  {
+    UInt16 c = s[i];
+    if (c == 0)
+      break;
+    if (c < 0x20)
+      c = '_';
+    dest[i] = c;
+  }
+
+  if (i == 0)
+    dest[i++] = '_';
+  if (isDir && dest[i - 1] != '/')
+    dest[i++] = '/';
+  dest[i] = 0;
+
+  return Utf16_To_Char(buf, dest
+      #ifndef MY_USE_UTF8
+      , CP_OEMCP
+      #endif
+      );
+}
+
+static void UInt64ToStr(UInt64 value, char *s, int numDigits)
 {
   char temp[32];
   int pos = 0;
@@ -195,6 +518,10 @@ static void UInt64ToStr(UInt64 value, char *s)
     value /= 10;
   }
   while (value != 0);
+
+  for (numDigits -= pos; numDigits > 0; numDigits--)
+    *s++ = ' ';
+
   do
     *s++ = temp[--pos];
   while (pos);
@@ -208,8 +535,10 @@ static char *UIntToStr(char *s, unsigned value, int numDigits)
   do
     temp[pos++] = (char)('0' + (value % 10));
   while (value /= 10);
+
   for (numDigits -= pos; numDigits > 0; numDigits--)
     *s++ = '0';
+
   do
     *s++ = temp[--pos];
   while (pos);
@@ -223,17 +552,143 @@ static void UIntToStr_2(char *s, unsigned value)
   s[1] = (char)('0' + (value % 10));
 }
 
+
 #define PERIOD_4 (4 * 365 + 1)
 #define PERIOD_100 (PERIOD_4 * 25 - 1)
 #define PERIOD_400 (PERIOD_100 * 4 + 1)
 
-static void ConvertFileTimeToString(const CNtfsFileTime *nt, char *s)
+
+
+#ifndef _WIN32
+
+// MS uses long for BOOL, but long is 32-bit in MS. So we use int.
+// typedef long BOOL;
+typedef int BOOL;
+
+typedef struct
+{
+  DWORD dwLowDateTime;
+  DWORD dwHighDateTime;
+} FILETIME;
+
+static LONG TIME_GetBias(void)
+{
+  const time_t utc = time(NULL);
+  struct tm *ptm = localtime(&utc);
+  const int localdaylight = ptm->tm_isdst; /* daylight for local timezone */
+  ptm = gmtime(&utc);
+  ptm->tm_isdst = localdaylight; /* use local daylight, not that of Greenwich */
+  return (int)(mktime(ptm) - utc);
+}
+
+#define TICKS_PER_SEC 10000000
+
+#define GET_TIME_64(pft) ((pft)->dwLowDateTime | ((UInt64)(pft)->dwHighDateTime << 32))
+
+#define SET_FILETIME(ft, v64) \
+   (ft)->dwLowDateTime = (DWORD)v64; \
+   (ft)->dwHighDateTime = (DWORD)(v64 >> 32);
+
+#define WINAPI
+#define TRUE 1
+
+static BOOL WINAPI FileTimeToLocalFileTime(const FILETIME *fileTime, FILETIME *localFileTime)
+{
+  UInt64 v = GET_TIME_64(fileTime);
+  v = (UInt64)((Int64)v - (Int64)TIME_GetBias() * TICKS_PER_SEC);
+  SET_FILETIME(localFileTime, v)
+  return TRUE;
+}
+
+static const UInt32 kNumTimeQuantumsInSecond = 10000000;
+static const UInt32 kFileTimeStartYear = 1601;
+static const UInt32 kUnixTimeStartYear = 1970;
+
+static Int64 Time_FileTimeToUnixTime64(const FILETIME *ft)
+{
+  const UInt64 kUnixTimeOffset =
+      (UInt64)60 * 60 * 24 * (89 + 365 * (kUnixTimeStartYear - kFileTimeStartYear));
+  const UInt64 winTime = GET_TIME_64(ft);
+  return (Int64)(winTime / kNumTimeQuantumsInSecond) - (Int64)kUnixTimeOffset;
+}
+
+#if defined(_AIX)
+  #define MY_ST_TIMESPEC st_timespec
+#else
+  #define MY_ST_TIMESPEC timespec
+#endif
+
+static void FILETIME_To_timespec(const FILETIME *ft, struct MY_ST_TIMESPEC *ts)
+{
+  if (ft)
+  {
+    const Int64 sec = Time_FileTimeToUnixTime64(ft);
+    // time_t is long
+    const time_t sec2 = (time_t)sec;
+    if (sec2 == sec)
+    {
+      ts->tv_sec = sec2;
+      {
+        const UInt64 winTime = GET_TIME_64(ft);
+        ts->tv_nsec = (long)((winTime % 10000000) * 100);
+      }
+      return;
+    }
+  }
+  // else
+  {
+    ts->tv_sec = 0;
+    // ts.tv_nsec = UTIME_NOW; // set to the current time
+    ts->tv_nsec = UTIME_OMIT; // keep old timesptamp
+  }
+}
+
+static WRes Set_File_FILETIME(const UInt16 *name, const FILETIME *mTime)
+{
+  struct timespec times[2];
+  
+  const int flags = 0; // follow link
+    // = AT_SYMLINK_NOFOLLOW; // don't follow link
+
+  CBuf buf;
+  int res;
+  Buf_Init(&buf);
+  RINOK(Utf16_To_Char(&buf, name MY_FILE_CODE_PAGE_PARAM))
+  FILETIME_To_timespec(NULL, &times[0]);
+  FILETIME_To_timespec(mTime, &times[1]);
+  res = utimensat(AT_FDCWD, (const char *)buf.data, times, flags);
+  Buf_Free(&buf, &g_Alloc);
+  if (res == 0)
+    return 0;
+  return errno;
+}
+
+#endif
+
+static void NtfsFileTime_to_FILETIME(const CNtfsFileTime *t, FILETIME *ft)
+{
+  ft->dwLowDateTime = (DWORD)(t->Low);
+  ft->dwHighDateTime = (DWORD)(t->High);
+}
+
+static void ConvertFileTimeToString(const CNtfsFileTime *nTime, char *s)
 {
   unsigned year, mon, hour, min, sec;
   Byte ms[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-  unsigned t;
+  UInt32 t;
   UInt32 v;
-  UInt64 v64 = nt->Low | ((UInt64)nt->High << 32);
+  // UInt64 v64 = nt->Low | ((UInt64)nt->High << 32);
+  UInt64 v64;
+  {
+    FILETIME fileTime, locTime;
+    NtfsFileTime_to_FILETIME(nTime, &fileTime);
+    if (!FileTimeToLocalFileTime(&fileTime, &locTime))
+    {
+      locTime.dwHighDateTime =
+      locTime.dwLowDateTime = 0;
+    }
+    v64 = locTime.dwLowDateTime | ((UInt64)locTime.dwHighDateTime << 32);
+  }
   v64 /= 10000000;
   sec = (unsigned)(v64 % 60); v64 /= 60;
   min = (unsigned)(v64 % 60); v64 /= 60;
@@ -252,10 +707,10 @@ static void ConvertFileTimeToString(const CNtfsFileTime *nt, char *s)
     ms[1] = 29;
   for (mon = 0;; mon++)
   {
-    unsigned s = ms[mon];
-    if (v < s)
+    const UInt32 d = ms[mon];
+    if (v < d)
       break;
-    v -= s;
+    v -= d;
   }
   s = UIntToStr(s, year, 4); *s++ = '-';
   UIntToStr_2(s, mon + 1); s[2] = '-'; s += 3;
@@ -265,431 +720,353 @@ static void ConvertFileTimeToString(const CNtfsFileTime *nt, char *s)
   UIntToStr_2(s, sec); s[2] = 0;
 }
 
-#ifdef USE_WINDOWS_FILE
-static void GetAttribString(UInt32 wa, Bool isDir, char *s)
+static void GetAttribString(UInt32 wa, BoolInt isDir, char *s)
 {
+  #ifdef USE_WINDOWS_FILE
   s[0] = (char)(((wa & FILE_ATTRIBUTE_DIRECTORY) != 0 || isDir) ? 'D' : '.');
   s[1] = (char)(((wa & FILE_ATTRIBUTE_READONLY ) != 0) ? 'R': '.');
   s[2] = (char)(((wa & FILE_ATTRIBUTE_HIDDEN   ) != 0) ? 'H': '.');
   s[3] = (char)(((wa & FILE_ATTRIBUTE_SYSTEM   ) != 0) ? 'S': '.');
   s[4] = (char)(((wa & FILE_ATTRIBUTE_ARCHIVE  ) != 0) ? 'A': '.');
-  s[5] = '\0';
+  s[5] = 0;
+  #else
+  s[0] = (char)(((wa & (1 << 4)) != 0 || isDir) ? 'D' : '.');
+  s[1] = 0;
+  #endif
 }
-#else
-static void GetAttribString(UInt32, Bool, char *s)
+
+
+typedef enum
 {
-  s[0] = '\0';
+  k_Szx_Extract,
+  k_Szx_List,
+  k_Szx_Test
+} ESzxCommand;
+
+// appends "<time>\t<attributes>\t<size>\t<path>\n" to the list, if there's enough space left
+static void List_AddEntry(char *list, size_t *listPos, size_t listSize,
+    const char *t, const char *attr, const char *s, const char *path)
+{
+  const char * const parts[4] = { t, attr, s, path };
+  size_t pos = *listPos;
+  size_t lineSize = 0;
+  unsigned k;
+
+  for (k = 0; k < 4; k++)
+    lineSize += strlen(parts[k]) + 1;
+  if (lineSize >= listSize - pos)
+    return;
+
+  for (k = 0; k < 4; k++)
+  {
+    const size_t len = strlen(parts[k]);
+    memcpy(list + pos, parts[k], len);
+    pos += len;
+    list[pos++] = (char)(k == 3 ? '\n' : '\t');
+  }
+  list[pos] = 0;
+  *listPos = pos;
 }
-#endif
 
-// #define NUM_PARENTS_MAX 128
-
-SRes SzxExtract(const char* filename, Bool fullPaths)
+static SRes Szx_Run(const char *filename, ESzxCommand command, BoolInt fullPaths, char *list, size_t *listSize)
 {
-  CFileInStream archiveStream;
-  CLookToRead lookStream;
-  CSzArEx db;
-  SRes res;
   ISzAlloc allocImp;
   ISzAlloc allocTempImp;
+
+  CFileInStream archiveStream;
+  CLookToRead2 lookStream;
+  CSzArEx db;
+  SRes res;
   UInt16 *temp = NULL;
+  UInt16 *temp2 = NULL;
   size_t tempSize = 0;
-  // UInt32 parents[NUM_PARENTS_MAX];
+  size_t listPos = 0;
+  const int listCommand = (command == k_Szx_List);
+  const int testCommand = (command == k_Szx_Test);
+
+  if (!filename)
+    return SZ_ERROR_PARAM;
+
+  if (listCommand)
+  {
+    if (!list || !listSize || *listSize == 0)
+      return SZ_ERROR_PARAM;
+    list[0] = 0;
+  }
 
   #if defined(_WIN32) && !defined(USE_WINDOWS_FILE) && !defined(UNDER_CE)
   g_FileCodePage = AreFileApisANSI() ? CP_ACP : CP_OEMCP;
   #endif
 
-  allocImp.Alloc = SzAlloc;
-  allocImp.Free = SzFree;
 
-  allocTempImp.Alloc = SzAllocTemp;
-  allocTempImp.Free = SzFreeTemp;
+  allocImp = g_Alloc;
+  allocTempImp = g_Alloc;
+  // allocTempImp = g_Alloc_temp;
 
-  #ifdef UNDER_CE
-  if (InFile_OpenW(&archiveStream.file, L"\test.7z"))
-  #else
-  if (InFile_Open(&archiveStream.file, filename))
-  #endif
-  {
+  if (InFile_Open(&archiveStream.file, filename) != 0)
     return SZ_ERROR_FAIL;
-  }
 
   FileInStream_CreateVTable(&archiveStream);
-  LookToRead_CreateVTable(&lookStream, False);
+  archiveStream.wres = 0;
+  LookToRead2_CreateVTable(&lookStream, False);
+  lookStream.buf = NULL;
 
-  lookStream.realStream = &archiveStream.s;
-  LookToRead_Init(&lookStream);
+  res = SZ_OK;
+
+  {
+    lookStream.buf = (Byte *)ISzAlloc_Alloc(&allocImp, kInputBufSize);
+    if (!lookStream.buf)
+      res = SZ_ERROR_MEM;
+    else
+    {
+      lookStream.bufSize = kInputBufSize;
+      lookStream.realStream = &archiveStream.vt;
+      LookToRead2_INIT(&lookStream)
+    }
+  }
 
   CrcGenerateTable();
 
   SzArEx_Init(&db);
-  res = SzArEx_Open(&db, &lookStream.s, &allocImp, &allocTempImp);
+
   if (res == SZ_OK)
   {
-    UInt32 i;
+    res = SzArEx_Open(&db, &lookStream.vt, &allocImp, &allocTempImp);
+  }
 
-    /*
-    if you need cache, use these 3 variables.
-    if you use external function, you can make these variable as static.
-    */
-    UInt32 blockIndex = 0xFFFFFFFF; /* it can have any value before first call (if outBuffer = 0) */
-    Byte *outBuffer = 0; /* it must be 0 before first call for each new archive. */
-    size_t outBufferSize = 0;  /* it can have any value before first call (if outBuffer = 0) */
-
-    for (i = 0; i < db.NumFiles; i++)
+  if (res == SZ_OK)
+  {
     {
-      size_t offset = 0;
-      size_t outSizeProcessed = 0;
-      // const CSzFileItem *f = db.Files + i;
-      size_t len;
-      int isDir = SzArEx_IsDir(&db, i);
-      if (isDir && !fullPaths)
-        continue;
-      len = SzArEx_GetFileNameUtf16(&db, i, NULL);
-      // len = SzArEx_GetFullNameLen(&db, i);
+      UInt32 i;
 
-      if (len > tempSize)
+      /*
+      if you need cache, use these 3 variables.
+      if you use external function, you can make these variable as static.
+      */
+      UInt32 blockIndex = 0xFFFFFFFF; /* it can have any value before first call (if outBuffer = 0) */
+      Byte *outBuffer = 0; /* it must be 0 before first call for each new archive. */
+      size_t outBufferSize = 0;  /* it can have any value before first call (if outBuffer = 0) */
+
+      for (i = 0; i < db.NumFiles; i++)
       {
-        SzFree(NULL, temp);
-        tempSize = len;
-        temp = (UInt16 *)SzAlloc(NULL, tempSize * sizeof(temp[0]));
-        if (!temp)
+        size_t offset = 0;
+        size_t outSizeProcessed = 0;
+        // const CSzFileItem *f = db.Files + i;
+        size_t len;
+        const BoolInt isDir = SzArEx_IsDir(&db, i);
+        if (listCommand == 0 && isDir && (testCommand || !fullPaths))
+          continue;
+        len = SzArEx_GetFileNameUtf16(&db, i, NULL);
+
+        if (len > (1u << 20))
         {
-          res = SZ_ERROR_MEM;
+          res = SZ_ERROR_UNSUPPORTED;
           break;
         }
-      }
 
-      SzArEx_GetFileNameUtf16(&db, i, temp);
-      /*
-      if (SzArEx_GetFullNameUtf16_Back(&db, i, temp + len) != temp)
-      {
-        res = SZ_ERROR_FAIL;
-        break;
-      }
-      */
-
-      if (!isDir)
-      {
-        res = SzArEx_Extract(&db, &lookStream.s, i,
-            &blockIndex, &outBuffer, &outBufferSize,
-            &offset, &outSizeProcessed,
-            &allocImp, &allocTempImp);
-        if (res != SZ_OK)
-          break;
-      }
-
-      CSzFile outFile;
-      size_t processedSize;
-      size_t j;
-      UInt16 *name = (UInt16 *)temp;
-      const UInt16 *destPath = (const UInt16 *)name;
-      for (j = 0; name[j] != 0; j++)
-        if (name[j] == '/')
+        if (len > tempSize || !temp)
         {
-          if (fullPaths)
+          SzFree(NULL, temp);
+          tempSize = len;
+          // temp2 requires additional space for "_" additions for "COM1" and empty names,
+          // and up to 2 additional characters for GetListPath().
+          temp = (UInt16 *)SzAlloc(NULL, (tempSize * 3 + 16) * sizeof(temp[0]));
+          if (!temp)
           {
-            name[j] = 0;
-            MyCreateDir(name);
-            name[j] = CHAR_PATH_SEPARATOR;
+            res = SZ_ERROR_MEM;
+            break;
+          }
+          temp2 = temp + tempSize;
+        }
+
+        SzArEx_GetFileNameUtf16(&db, i, temp);
+        /*
+        if (SzArEx_GetFullNameUtf16_Back(&db, i, temp + len) != temp)
+        {
+          res = SZ_ERROR_FAIL;
+          break;
+        }
+        */
+
+        if (listCommand)
+        {
+          char attr[8], s[32], t[32];
+          UInt64 fileSize;
+          CBuf buf;
+
+          GetAttribString(SzBitWithVals_Check(&db.Attribs, i) ? db.Attribs.Vals[i] : 0, isDir, attr);
+
+          fileSize = SzArEx_GetFileSize(&db, i);
+          UInt64ToStr(fileSize, s, 0);
+
+          if (SzBitWithVals_Check(&db.MTime, i))
+            ConvertFileTimeToString(&db.MTime.Vals[i], t);
+          else
+          {
+            size_t j;
+            for (j = 0; j < 19; j++)
+              t[j] = ' ';
+            t[j] = '\0';
+          }
+
+          Buf_Init(&buf);
+          res = GetListPath(&buf, temp, temp2, isDir);
+          if (res == SZ_OK)
+            List_AddEntry(list, &listPos, *listSize, t, attr, s, (const char *)buf.data);
+          Buf_Free(&buf, &g_Alloc);
+          if (res != SZ_OK)
+            break;
+          continue;
+        }
+
+        if (!isDir)
+        {
+          res = SzArEx_Extract(&db, &lookStream.vt, i,
+              &blockIndex, &outBuffer, &outBufferSize,
+              &offset, &outSizeProcessed,
+              &allocImp, &allocTempImp);
+          if (res != SZ_OK)
+            break;
+        }
+
+        if (!testCommand)
+        {
+          CSzFile outFile;
+          size_t processedSize;
+          size_t j;
+
+          UInt16 *name = (UInt16 *)temp2;
+          const UInt16 *destPath = (const UInt16 *)name;
+
+          // memset(temp2, 0, (tempSize) * sizeof(temp[0])); // for debug
+          NormalizePath_for_FS(temp2, temp, isDir);
+
+          for (j = 0; name[j] != 0; j++)
+            if (name[j] == CHAR_PATH_SEPARATOR)
+            {
+              if (fullPaths)
+              {
+                name[j] = 0;
+                MyCreateDir(name);
+                name[j] = CHAR_PATH_SEPARATOR;
+              }
+              else
+                destPath = name + j + 1;
+            }
+
+          if (isDir)
+          {
+            MyCreateDir(destPath);
+            continue;
           }
           else
-            destPath = name + j + 1;
-        }
+          {
+            My_DeleteFileAlways(destPath);
+            if (OutFile_OpenUtf16(&outFile, destPath))
+            {
+              res = SZ_ERROR_FAIL;
+              break;
+            }
+          }
 
-      if (isDir)
-      {
-        MyCreateDir(destPath);
-        continue;
+          processedSize = outSizeProcessed;
+
+          {
+            const WRes wres = File_Write(&outFile, outBuffer + offset, &processedSize);
+            if (wres != 0 || processedSize != outSizeProcessed)
+            {
+              File_Close(&outFile);
+              res = SZ_ERROR_FAIL;
+              break;
+            }
+          }
+
+          {
+            FILETIME mtime;
+            FILETIME *mtimePtr = NULL;
+
+            #ifdef USE_WINDOWS_FILE
+            FILETIME ctime;
+            FILETIME *ctimePtr = NULL;
+            #endif
+
+            if (SzBitWithVals_Check(&db.MTime, i))
+            {
+              const CNtfsFileTime *t = &db.MTime.Vals[i];
+              mtime.dwLowDateTime = (DWORD)(t->Low);
+              mtime.dwHighDateTime = (DWORD)(t->High);
+              mtimePtr = &mtime;
+            }
+
+            #ifdef USE_WINDOWS_FILE
+            if (SzBitWithVals_Check(&db.CTime, i))
+            {
+              const CNtfsFileTime *t = &db.CTime.Vals[i];
+              ctime.dwLowDateTime = (DWORD)(t->Low);
+              ctime.dwHighDateTime = (DWORD)(t->High);
+              ctimePtr = &ctime;
+            }
+
+            if (mtimePtr || ctimePtr)
+              SetFileTime(outFile.handle, ctimePtr, NULL, mtimePtr);
+            #endif
+
+            if (File_Close(&outFile) != 0)
+            {
+              res = SZ_ERROR_FAIL;
+              break;
+            }
+
+            #ifndef USE_WINDOWS_FILE
+            #ifdef _WIN32
+            mtimePtr = mtimePtr;
+            #else
+            if (mtimePtr)
+              Set_File_FILETIME(destPath, mtimePtr);
+            #endif
+            #endif
+          }
+
+          #ifdef USE_WINDOWS_FILE
+          if (SzBitWithVals_Check(&db.Attribs, i))
+          {
+            UInt32 attrib = db.Attribs.Vals[i];
+            /* p7zip stores posix attributes in high 16 bits and adds 0x8000 as marker.
+               We remove posix bits, if we detect posix mode field */
+            if (attrib & 0xF0000000)
+              attrib &= 0x7FFF;
+            SetFileAttributesW((LPCWSTR)destPath, attrib);
+          }
+          #endif
+        }
       }
-      else if (OutFile_OpenUtf16(&outFile, destPath))
-      {
-        res = SZ_ERROR_FAIL;
-        break;
-      }
-      processedSize = outSizeProcessed;
-      if (File_Write(&outFile, outBuffer + offset, &processedSize) != 0 || processedSize != outSizeProcessed)
-      {
-        res = SZ_ERROR_FAIL;
-        break;
-      }
-      if (File_Close(&outFile))
-      {
-        res = SZ_ERROR_FAIL;
-        break;
-      }
-      #ifdef USE_WINDOWS_FILE
-      if (SzBitWithVals_Check(&db.Attribs, i))
-        SetFileAttributesW(destPath, db.Attribs.Vals[i]);
-      #endif
+      ISzAlloc_Free(&allocImp, outBuffer);
     }
-    IAlloc_Free(&allocImp, outBuffer);
   }
-  SzArEx_Free(&db, &allocImp);
+
   SzFree(NULL, temp);
+  SzArEx_Free(&db, &allocImp);
+  ISzAlloc_Free(&allocImp, lookStream.buf);
 
   File_Close(&archiveStream.file);
 
+  if (listCommand)
+    *listSize = listPos;
+
   return res;
+}
+
+SRes SzxExtract(const char* filename, BoolInt fullPaths)
+{
+  return Szx_Run(filename, k_Szx_Extract, fullPaths, NULL, NULL);
 }
 
 SRes SzxList(const char* filename, char* list, size_t* size)
 {
-  CFileInStream archiveStream;
-  CLookToRead lookStream;
-  CSzArEx db;
-  SRes res;
-  ISzAlloc allocImp;
-  ISzAlloc allocTempImp;
-  UInt16 *temp = NULL;
-  size_t tempSize = 0;
-  // UInt32 parents[NUM_PARENTS_MAX];
-
-  #if defined(_WIN32) && !defined(USE_WINDOWS_FILE) && !defined(UNDER_CE)
-  g_FileCodePage = AreFileApisANSI() ? CP_ACP : CP_OEMCP;
-  #endif
-
-  allocImp.Alloc = SzAlloc;
-  allocImp.Free = SzFree;
-
-  allocTempImp.Alloc = SzAllocTemp;
-  allocTempImp.Free = SzFreeTemp;
-
-  #ifdef UNDER_CE
-  if (InFile_OpenW(&archiveStream.file, L"\test.7z"))
-  #else
-  if (InFile_Open(&archiveStream.file, filename))
-  #endif
-  {
-    return SZ_ERROR_FAIL;
-  }
-
-  FileInStream_CreateVTable(&archiveStream);
-  LookToRead_CreateVTable(&lookStream, False);
-
-  lookStream.realStream = &archiveStream.s;
-  LookToRead_Init(&lookStream);
-
-  CrcGenerateTable();
-
-  SzArEx_Init(&db);
-  res = SzArEx_Open(&db, &lookStream.s, &allocImp, &allocTempImp);
-  if (res == SZ_OK)
-  {
-    UInt32 i;
-    size_t listIt = 0;
-
-    /*
-    if you need cache, use these 3 variables.
-    if you use external function, you can make these variable as static.
-    */
-    Byte *outBuffer = 0; /* it must be 0 before first call for each new archive. */
-
-    for (i = 0; i < db.NumFiles; i++)
-    {
-      // const CSzFileItem *f = db.Files + i;
-      size_t len;
-      int isDir = SzArEx_IsDir(&db, i);
-      len = SzArEx_GetFileNameUtf16(&db, i, NULL);
-      // len = SzArEx_GetFullNameLen(&db, i);
-
-      if (len > tempSize)
-      {
-        SzFree(NULL, temp);
-        tempSize = len;
-        temp = (UInt16 *)SzAlloc(NULL, tempSize * sizeof(temp[0]));
-        if (!temp)
-        {
-          res = SZ_ERROR_MEM;
-          break;
-        }
-      }
-
-      SzArEx_GetFileNameUtf16(&db, i, temp);
-      /*
-      if (SzArEx_GetFullNameUtf16_Back(&db, i, temp + len) != temp)
-      {
-        res = SZ_ERROR_FAIL;
-        break;
-      }
-      */
-
-      char attr[8], s[32], t[32];
-      UInt64 fileSize;
-
-      GetAttribString(SzBitWithVals_Check(&db.Attribs, i) ? db.Attribs.Vals[i] : 0, isDir, attr);
-
-      fileSize = SzArEx_GetFileSize(&db, i);
-      UInt64ToStr(fileSize, s);
-      if (SzBitWithVals_Check(&db.MTime, i))
-        ConvertFileTimeToString(&db.MTime.Vals[i], t);
-      else
-      {
-        size_t j;
-        for (j = 0; j < 19; j++)
-          t[j] = ' ';
-        t[j] = '\0';
-      }
-
-      /*
-      generate list
-      */
-      CBuf buf;
-      Buf_Init(&buf);
-      res = Utf16_To_Char(&buf, temp
-      #ifdef _WIN32
-      , CP_OEMCP
-      #endif
-      );
-
-      if (res == SZ_OK)
-      {
-        size_t line = strlen(t) + strlen(attr) + strlen(s) + strlen(buf.data) + 3;
-
-        if(listIt + line < *size)
-        {
-          strncat(list, t, 32);
-          listIt += strlen(t);
-          list[listIt] = '\t';
-          list[listIt + 1] = '\0';
-
-          strncat(list, attr, 8);
-          listIt += strlen(attr) + 1;
-          list[listIt] = '\t';
-          list[listIt + 1] = '\0';
-
-          strncat(list, s, 32);
-          listIt += strlen(s) + 1;
-          list[listIt] = '\t';
-          list[listIt + 1] = '\0';
-
-          strncat(list, buf.data, buf.size);
-          listIt += strlen(buf.data) + 1;
-          list[listIt] = '\n';
-
-          ++listIt;
-        }
-      }
-
-      Buf_Free(&buf, &g_Alloc);
-    }
-
-    *size = listIt;
-
-    IAlloc_Free(&allocImp, outBuffer);
-  }
-  SzArEx_Free(&db, &allocImp);
-  SzFree(NULL, temp);
-
-  File_Close(&archiveStream.file);
-
-  return res;
+  return Szx_Run(filename, k_Szx_List, False, list, size);
 }
 
 SRes SzxTest(const char* filename)
 {
-  CFileInStream archiveStream;
-  CLookToRead lookStream;
-  CSzArEx db;
-  SRes res;
-  ISzAlloc allocImp;
-  ISzAlloc allocTempImp;
-  UInt16 *temp = NULL;
-  size_t tempSize = 0;
-  // UInt32 parents[NUM_PARENTS_MAX];
-
-  #if defined(_WIN32) && !defined(USE_WINDOWS_FILE) && !defined(UNDER_CE)
-  g_FileCodePage = AreFileApisANSI() ? CP_ACP : CP_OEMCP;
-  #endif
-
-  allocImp.Alloc = SzAlloc;
-  allocImp.Free = SzFree;
-
-  allocTempImp.Alloc = SzAllocTemp;
-  allocTempImp.Free = SzFreeTemp;
-
-  #ifdef UNDER_CE
-  if (InFile_OpenW(&archiveStream.file, L"\test.7z"))
-  #else
-  if (InFile_Open(&archiveStream.file, filename))
-  #endif
-  {
-    return SZ_ERROR_FAIL;
-  }
-
-  FileInStream_CreateVTable(&archiveStream);
-  LookToRead_CreateVTable(&lookStream, False);
-
-  lookStream.realStream = &archiveStream.s;
-  LookToRead_Init(&lookStream);
-
-  CrcGenerateTable();
-
-  SzArEx_Init(&db);
-  res = SzArEx_Open(&db, &lookStream.s, &allocImp, &allocTempImp);
-  if (res == SZ_OK)
-  {
-    UInt32 i;
-
-    /*
-    if you need cache, use these 3 variables.
-    if you use external function, you can make these variable as static.
-    */
-    UInt32 blockIndex = 0xFFFFFFFF; /* it can have any value before first call (if outBuffer = 0) */
-    Byte *outBuffer = 0; /* it must be 0 before first call for each new archive. */
-    size_t outBufferSize = 0;  /* it can have any value before first call (if outBuffer = 0) */
-
-    for (i = 0; i < db.NumFiles; i++)
-    {
-      size_t offset = 0;
-      size_t outSizeProcessed = 0;
-      // const CSzFileItem *f = db.Files + i;
-      size_t len;
-      int isDir = SzArEx_IsDir(&db, i);
-      if (isDir)
-        continue;
-      len = SzArEx_GetFileNameUtf16(&db, i, NULL);
-      // len = SzArEx_GetFullNameLen(&db, i);
-
-      if (len > tempSize)
-      {
-        SzFree(NULL, temp);
-        tempSize = len;
-        temp = (UInt16 *)SzAlloc(NULL, tempSize * sizeof(temp[0]));
-        if (!temp)
-        {
-          res = SZ_ERROR_MEM;
-          break;
-        }
-      }
-
-      SzArEx_GetFileNameUtf16(&db, i, temp);
-      /*
-      if (SzArEx_GetFullNameUtf16_Back(&db, i, temp + len) != temp)
-      {
-        res = SZ_ERROR_FAIL;
-        break;
-      }
-      */
-
-      if (!isDir)
-      {
-        res = SzArEx_Extract(&db, &lookStream.s, i,
-            &blockIndex, &outBuffer, &outBufferSize,
-            &offset, &outSizeProcessed,
-            &allocImp, &allocTempImp);
-        if (res != SZ_OK)
-          break;
-      }
-    }
-    IAlloc_Free(&allocImp, outBuffer);
-
-  }
-  SzArEx_Free(&db, &allocImp);
-  SzFree(NULL, temp);
-
-  File_Close(&archiveStream.file);
-
-  return res;
+  return Szx_Run(filename, k_Szx_Test, False, NULL, NULL);
 }

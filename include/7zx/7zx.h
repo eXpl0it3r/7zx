@@ -1,14 +1,14 @@
-/* lib7z.h -- Library header for 7zx
-2015-03-22 : Lukas Duerrenberger : Public domain */
+/* 7zx.h -- Library header for 7zx
+2026-10-01 : Lukas Duerrenberger : Public domain */
 
 #ifndef __LIB7ZX_H
 #define __LIB7ZX_H
 
+#include <7zx/7zTypes.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#include <7zx/7zTypes.h>
 
 ////////////////////////////////////////////////////////////
 /// \brief Extract an 7z archive
@@ -19,14 +19,22 @@ extern "C" {
 /// \return SZ_OK if successful
 ///
 ////////////////////////////////////////////////////////////
-extern SRes SzxExtract(const char* filename, Bool fullPaths = 1);
+#ifdef __cplusplus
+extern SRes SzxExtract(const char* filename, BoolInt fullPaths = 1);
+#else
+extern SRes SzxExtract(const char* filename, BoolInt fullPaths);
+#endif
 
 ////////////////////////////////////////////////////////////
 /// \brief List the content of an 7z archive
 ///
+/// Every entry is written as one line in the form of
+/// "<modified>\t<attributes>\t<size>\t<path>\n".
+/// Entries that don't fit into the buffer anymore are left out.
+///
 /// \param filename Filename of the 7z archive
 /// \param list Byte buffer to get the archive's list
-/// \param size Size of the buffer
+/// \param size Size of the buffer, gets set to the length of the list
 ///
 /// \return SZ_OK if successful
 ///
@@ -51,7 +59,8 @@ extern SRes SzxTest(const char* filename);
 
 ////////////////////////////////////////////////////////////
 /// 7zx is a small C library to extract, test and list 7z / 7zip archives.
-/// Supported formats are LZMA, LZMA2 and PPMD.
+/// Supported methods are LZMA, LZMA2 and PPMd, plus the BCJ, BCJ2,
+/// ARM64, ARM, ARMT, PPC, IA64, SPARC, RISCV and Delta filters.
 ///
 /// Usage example:
 /// \code
